@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include <haproxy/acl.h>
@@ -26,10 +27,180 @@
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
+enum {
+	CLIENTHELLO_ERR_OK = 0,
+	CLIENTHELLO_ERR_UNAVAIL = 1,
+	CLIENTHELLO_ERR_TOO_SHORT = 2,
+};
+
+/**
+ * struct to hold variables used during generic client hello parsing
+ */
+struct clnt_hello_proc {
+	int hs_len;
+	int status;
+	unsigned char *data;
+};
+
 
 /************************************************************************/
 /*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
+
+
+/* Extract information presented in a TLS client hello handshake message.
+ * The format of the message is the following (cf RFC5246 + RFC6066) :
+ * TLS frame :
+ *   - uint8  type                            = 0x16   (Handshake)
+ *   - uint16 version                        >= 0x0301 (TLSv1)
+ *   - uint16 length                                   (frame length)
+ *   - TLS handshake :
+ *     - uint8  msg_type                      = 0x01   (ClientHello)
+ *     - uint24 length                                 (handshake message length)
+ *     - ClientHello :
+ *       - uint16 client_version             >= 0x0301 (TLSv1)
+ *       - uint8 Random[32]                  (4 first ones are timestamp)
+ *       - SessionID :
+ *         - uint8 session_id_len (0..32)              (SessionID len in bytes)
+ *         - uint8 session_id[session_id_len]
+ *       - CipherSuite :
+ *         - uint16 cipher_len               >= 2      (Cipher length in bytes)
+ *         - uint16 ciphers[cipher_len/2]
+ *       - CompressionMethod :
+ *         - uint8 compression_len           >= 1      (# of supported methods)
+ *         - uint8 compression_methods[compression_len]
+ *       - optional client_extension_len               (in bytes)
+ *       - optional sequence of ClientHelloExtensions  (as many bytes as above):
+ *         - uint16 extension_type            = 0 for server_name
+ *         - uint16 extension_len
+ *         - opaque extension_data[extension_len]
+ *           - uint16 server_name_list_len             (# of bytes here)
+ *           - opaque server_names[server_name_list_len bytes]
+ *             - uint8 name_type              = 0 for host_name
+ *             - uint16 name_len
+ *             - opaque hostname[name_len bytes]
+ */
+struct clnt_hello_proc smp_client_hello_parse( struct sample *smp, bool parse_extensions)
+{
+	int hs_len, ext_len, bleft;
+	int status = CLIENTHELLO_ERR_OK;
+	struct channel *chn;
+	struct clnt_hello_proc cp;
+	unsigned char *data;
+
+	if (!smp->strm)
+		goto not_ssl_hello;
+
+	/* meaningless for HTX buffers */
+	if (IS_HTX_STRM(smp->strm))
+		goto not_ssl_hello;
+
+	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+
+
+	bleft = ci_data(chn);
+	data = (unsigned char *)ci_head(chn);
+
+	/* Check for SSL/TLS Handshake */
+	if (!bleft)
+		goto too_short;
+	if (*data != 0x16)
+		goto not_ssl_hello;
+
+	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
+	if (bleft < 3)
+		goto too_short;
+	if (data[1] < 0x03)
+		goto not_ssl_hello;
+
+	if (bleft < 5)
+		goto too_short;
+	hs_len = (data[3] << 8) + data[4];
+	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
+		goto not_ssl_hello; /* too short to have an extension */
+
+	data += 5; /* enter TLS handshake */
+	bleft -= 5;
+
+	/* Check for a complete client hello starting at <data> */
+	if (bleft < 1)
+		goto too_short;
+	if (data[0] != 0x01) /* msg_type = Client Hello */
+		goto not_ssl_hello;
+
+	/* Check the Hello's length */
+	if (bleft < 4)
+		goto too_short;
+	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
+	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
+		goto not_ssl_hello; /* too short to have an extension */
+
+	/* We want the full handshake here */
+	if (bleft < hs_len)
+		goto too_short;
+
+	data += 4;
+	/* Start of the ClientHello message */
+	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
+		goto not_ssl_hello;
+
+	ext_len = data[34]; /* session_id_len */
+	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
+		goto not_ssl_hello;
+
+	/* Jump to cipher suite */
+	hs_len -= 35 + ext_len;
+	data   += 35 + ext_len;
+
+	if (hs_len < 4 ||                               /* minimum one cipher */
+	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
+	    ext_len > hs_len)
+		goto not_ssl_hello;
+
+    /* Jump to the compression methods. For fetching cipher list this processing is not required. */
+	if (parse_extensions)
+		goto parse_extn;
+	else
+		goto parse_cipher;
+
+parse_extn:
+	hs_len -= 2 + ext_len;
+	data   += 2 + ext_len;
+
+	if (hs_len < 2 ||                       /* minimum one compression method */
+	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
+		goto not_ssl_hello;
+
+	/* Jump to the extensions */
+	hs_len -= 1 + data[0];
+	data   += 1 + data[0];
+
+	if (hs_len < 2 ||                       /* minimum one extension list length */
+	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
+		goto not_ssl_hello;
+
+	hs_len = ext_len; /* limit ourselves to the extension length */
+	data += 2;
+
+	cp.hs_len = hs_len;
+	cp.data = data;
+	cp.status = status;
+	return cp;
+
+parse_cipher:
+	cp.hs_len = ext_len;
+	cp.data = data;
+	cp.status = status;
+	return cp;
+
+not_ssl_hello:
+	cp.status = CLIENTHELLO_ERR_UNAVAIL;
+
+too_short:
+	cp.status = CLIENTHELLO_ERR_TOO_SHORT;
+
+	return cp;
+}
 
 /* wait for more data as long as possible, then return TRUE. This should be
  * used with content inspection.
@@ -83,105 +254,21 @@ smp_fetch_len(const struct arg *args, struct sample *smp, const char *kw, void *
 static int
 smp_fetch_req_ssl_st_ext(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft;
-	struct channel *chn;
-	unsigned char *data;
-
-	if (!smp->strm)
+	struct clnt_hello_proc cp;
+    cp = smp_client_hello_parse(smp, true);
+    if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-
-
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
-		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
+    else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
 
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
 
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
-
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
-	    ext_len > hs_len)
-		goto not_ssl_hello;
-
-	/* Jump to the compression methods */
-	hs_len -= 2 + ext_len;
-	data   += 2 + ext_len;
-
-	if (hs_len < 2 ||                       /* minimum one compression method */
-	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
-		goto not_ssl_hello;
-
-	/* Jump to the extensions */
-	hs_len -= 1 + data[0];
-	data   += 1 + data[0];
-
-	if (hs_len < 2 ||                       /* minimum one extension list length */
-	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
-		goto not_ssl_hello;
-
-	hs_len = ext_len; /* limit ourselves to the extension length */
-	data += 2;
-
-	while (hs_len >= 4) {
+	while (cp.hs_len >= 4) {
 		int ext_type, ext_len;
 
-		ext_type = (data[0] << 8) + data[1];
-		ext_len  = (data[2] << 8) + data[3];
+		ext_type = (cp.data[0] << 8) + cp.data[1];
+		ext_len  = (cp.data[2] << 8) + cp.data[3];
 
-		if (ext_len > hs_len - 4) /* Extension too long */
+		if (ext_len > cp.hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
 		/* SesstionTicket extension */
@@ -197,8 +284,8 @@ smp_fetch_req_ssl_st_ext(const struct arg *args, struct sample *smp, const char 
 			return 1;
 		}
 
-		hs_len -= 4 + ext_len;
-		data   += 4 + ext_len;
+		cp.hs_len -= 4 + ext_len;
+		cp.data   += 4 + ext_len;
 	}
 	/* SessionTicket Extension not found */
 	smp->data.type = SMP_T_SINT;
@@ -219,103 +306,20 @@ smp_fetch_req_ssl_st_ext(const struct arg *args, struct sample *smp, const char 
 static int
 smp_fetch_req_ssl_ec_ext(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft;
-	struct channel *chn;
-	unsigned char *data;
-
-	if (!smp->strm)
+	struct clnt_hello_proc cp;
+    cp = smp_client_hello_parse(smp, true);
+    if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
-		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
+    else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
 
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
-
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
-
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
-	    ext_len > hs_len)
-		goto not_ssl_hello;
-
-	/* Jump to the compression methods */
-	hs_len -= 2 + ext_len;
-	data   += 2 + ext_len;
-
-	if (hs_len < 2 ||                       /* minimum one compression method */
-	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
-		goto not_ssl_hello;
-
-	/* Jump to the extensions */
-	hs_len -= 1 + data[0];
-	data   += 1 + data[0];
-
-	if (hs_len < 2 ||                       /* minimum one extension list length */
-	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
-		goto not_ssl_hello;
-
-	hs_len = ext_len; /* limit ourselves to the extension length */
-	data += 2;
-
-	while (hs_len >= 4) {
+	while (cp.hs_len >= 4) {
 		int ext_type, ext_len;
 
-		ext_type = (data[0] << 8) + data[1];
-		ext_len  = (data[2] << 8) + data[3];
+		ext_type = (cp.data[0] << 8) + cp.data[1];
+		ext_len  = (cp.data[2] << 8) + cp.data[3];
 
-		if (ext_len > hs_len - 4) /* Extension too long */
+		if (ext_len > cp.hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
 		/* Elliptic curves extension */
@@ -326,8 +330,8 @@ smp_fetch_req_ssl_ec_ext(const struct arg *args, struct sample *smp, const char 
 			return 1;
 		}
 
-		hs_len -= 4 + ext_len;
-		data   += 4 + ext_len;
+		cp.hs_len -= 4 + ext_len;
+		cp.data   += 4 + ext_len;
 	}
 	/* server name not found */
 	goto not_ssl_hello;
@@ -528,80 +532,16 @@ smp_fetch_req_ssl_ver(const struct arg *args, struct sample *smp, const char *kw
 static int
 smp_fetch_ssl_cipherlist(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft;
-	struct channel *chn;
-	unsigned char *data;
-
-	if (!smp->strm)
+    struct clnt_hello_proc cp;
+    cp = smp_client_hello_parse(smp, false);
+    if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
+    else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
-		goto too_short;
-
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
-
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
-
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-	    (ext_len = (data[0] << 8) + data[1]) < 2 ||  /* minimum 2 bytes for a cipher */
-	     ext_len > hs_len)
-		goto not_ssl_hello;
 
 	smp->data.type = SMP_T_BIN;
-	smp->data.u.str.area = (char *)data + 2;
-	smp->data.u.str.data = ext_len;
+	smp->data.u.str.area = (char *)cp.data + 2;
+	smp->data.u.str.data = cp.hs_len;
 	smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
 
 	return 1;
@@ -620,122 +560,41 @@ not_ssl_hello:
 static int
 smp_fetch_ssl_supported_groups(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft;
-	struct channel *chn;
-	unsigned char *data;
+	struct clnt_hello_proc cp;
 
-	if (!smp->strm)
+	cp = smp_client_hello_parse(smp, true);
+	if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
-		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
+	else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
 
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
+	while (cp.hs_len >= 4) {
+		int ext_type,  ext_len, grp_len;
 
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
+		ext_type = (cp.data[0] << 8) + cp.data[1]; /* Extension type */
+		ext_len  = (cp.data[2] << 8) + cp.data[3]; /* Extension length */
 
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-	    (ext_len = (data[0] << 8) + data[1]) < 2 ||  /* minimum 2 bytes for a cipher */
-	     ext_len > hs_len)
-		goto not_ssl_hello;
-
-	/* Jump to the compression methods */
-	hs_len -= 2 + ext_len;
-	data   += 2 + ext_len;
-
-	if (hs_len < 2 ||                       /* minimum one compression method */
-	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
-		goto not_ssl_hello;
-
-	/* Jump to the extensions */
-	hs_len -= 1 + data[0];
-	data   += 1 + data[0];
-
-	if (hs_len < 2 ||                       /* minimum one extension list length */
-	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
-		goto not_ssl_hello;
-
-	hs_len = ext_len; /* limit ourselves to the extension length */
-	data += 2; /* Now 'data' points to the first content byte of an extension */
-
-	while (hs_len >= 4) {
-		int ext_type, grp_len;
-
-		ext_type = (data[0] << 8) + data[1]; /* Extension type */
-		ext_len  = (data[2] << 8) + data[3]; /* Extension length */
-
-		if (ext_len > hs_len - 4) /* Extension too long */
+		if (ext_len > cp.hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
 		if (ext_type == 10) { /* Supported groups extension type ID is 10dec */
 			if (ext_len < 2)  /* need at least one entry of 2 bytes in the list length */
 				goto not_ssl_hello;
 
-			grp_len = (data[4] << 8) + data[5]; /* Supported group list length */
-			if (grp_len < 2 || grp_len > hs_len - 6)
+			grp_len = (cp.data[4] << 8) + cp.data[5]; /* Supported group list length */
+			if (grp_len < 2 || grp_len > cp.hs_len - 6)
 				goto not_ssl_hello; /* at least 2 bytes per supported group */
 
 			smp->data.type = SMP_T_BIN;
-			smp->data.u.str.area = (char *)data + 6;
+			smp->data.u.str.area = (char *)cp.data + 6;
 			smp->data.u.str.data = grp_len;
 			smp->flags = SMP_F_VOL_SESS | SMP_F_CONST;
 
 			return 1;
 
 		}
-		hs_len -= 4 + ext_len;
-		data   += 4 + ext_len;
+		cp.hs_len -= 4 + ext_len;
+		cp.data   += 4 + ext_len;
 	}
 	/* supported groups not found */
 	goto not_ssl_hello;
@@ -754,122 +613,41 @@ not_ssl_hello:
 static int
 smp_fetch_ssl_sigalgs(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft;
-	struct channel *chn;
-	unsigned char *data;
+	struct clnt_hello_proc cp;
 
-	if (!smp->strm)
+	cp = smp_client_hello_parse(smp, true);
+	if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
-		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
+	else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
 
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
+	while (cp.hs_len >= 4) {
+		int ext_type,  ext_len, sigalg_len;
 
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
+		ext_type = (cp.data[0] << 8) + cp.data[1]; /* Extension type */
+		ext_len  = (cp.data[2] << 8) + cp.data[3]; /* Extension length */
 
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-			(ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
-			ext_len > hs_len)
-		goto not_ssl_hello;
-
-	/* Jump to the compression methods */
-	hs_len -= 2 + ext_len;
-	data   += 2 + ext_len;
-
-	if (hs_len < 2 ||                       /* minimum one compression method */
-	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
-		goto not_ssl_hello;
-
-	/* Jump to the extensions */
-	hs_len -= 1 + data[0];
-	data   += 1 + data[0];
-
-	if (hs_len < 2 ||                       /* minimum one extension list length */
-	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
-		goto not_ssl_hello;
-
-	hs_len = ext_len; /* limit ourselves to the extension length */
-	data += 2; /* Now 'data' points to the first content byte of an extension */
-
-	while (hs_len >= 4) {
-		int ext_type, sigalg_len;
-
-		ext_type = (data[0] << 8) + data[1]; /* Extension type */
-		ext_len  = (data[2] << 8) + data[3]; /* Extension length */
-
-		if (ext_len > hs_len - 4) /* Extension too long */
+		if (ext_len > cp.hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
 		if (ext_type == 13) { /* Sigalgs extension type ID is 13dec */
 			if (ext_len < 2) /* need at least one entry of 2 bytes in the list length */
 				goto not_ssl_hello;
 
-			sigalg_len = (data[4] << 8) + data[5]; /* Sigalgs list length */
-			if (sigalg_len < 2 || sigalg_len > hs_len - 6)
+			sigalg_len = (cp.data[4] << 8) + cp.data[5]; /* Sigalgs list length */
+			if (sigalg_len < 2 || sigalg_len > cp.hs_len - 6)
 				goto not_ssl_hello; /* at least 2 bytes per sigalg */
 
 			smp->data.type = SMP_T_BIN;
-			smp->data.u.str.area = (char *)data + 6;
+			smp->data.u.str.area = (char *)cp.data + 6;
 			smp->data.u.str.data = sigalg_len;
 			smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
 
 			return 1;
 
 		}
-		hs_len -= 4 + ext_len;
-		data   += 4 + ext_len;
+		cp.hs_len -= 4 + ext_len;
+		cp.data   += 4 + ext_len;
 	}
 	/* sigalgs not found */
 	goto not_ssl_hello;
@@ -888,115 +666,34 @@ not_ssl_hello:
 static int
 smp_fetch_ssl_keyshare_groups(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	int hs_len, ext_len, bleft, readPosition, numberOfKeyshares;
-	struct channel *chn;
+	int readPosition, numberOfKeyshares;
 	struct buffer *smp_trash = NULL;
-	unsigned char *data;
 	unsigned char *dataPointer;
+	struct clnt_hello_proc cp;
 
-	if (!smp->strm)
+	cp = smp_client_hello_parse(smp, true);
+	if (cp.status == CLIENTHELLO_ERR_UNAVAIL)
 		goto not_ssl_hello;
-
-	/* meaningless for HTX buffers */
-	if (IS_HTX_STRM(smp->strm))
-		goto not_ssl_hello;
-
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = ci_data(chn);
-	data = (unsigned char *)ci_head(chn);
-
-	/* Check for SSL/TLS Handshake */
-	if (!bleft)
-		goto too_short;
-	if (*data != 0x16)
-		goto not_ssl_hello;
-
-	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
-	if (bleft < 3)
-		goto too_short;
-	if (data[1] < 0x03)
-		goto not_ssl_hello;
-
-	if (bleft < 5)
-		goto too_short;
-	hs_len = (data[3] << 8) + data[4];
-	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	data += 5; /* enter TLS handshake */
-	bleft -= 5;
-
-	/* Check for a complete client hello starting at <data> */
-	if (bleft < 1)
-		goto too_short;
-	if (data[0] != 0x01) /* msg_type = Client Hello */
-		goto not_ssl_hello;
-
-	/* Check the Hello's length */
-	if (bleft < 4)
-		goto too_short;
-	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
-	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
-		goto not_ssl_hello; /* too short to have an extension */
-
-	/* We want the full handshake here */
-	if (bleft < hs_len)
+	else if (cp.status == CLIENTHELLO_ERR_TOO_SHORT)
 		goto too_short;
 
-	data += 4;
-	/* Start of the ClientHello message */
-	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
-		goto not_ssl_hello;
+	while (cp.hs_len >= 4) {
+		int ext_type,  ext_len, keyshare_len;
 
-	ext_len = data[34]; /* session_id_len */
-	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
-		goto not_ssl_hello;
+		ext_type = (cp.data[0] << 8) + cp.data[1]; /* Extension type */
+		ext_len  = (cp.data[2] << 8) + cp.data[3]; /* Extension length */
 
-	/* Jump to cipher suite */
-	hs_len -= 35 + ext_len;
-	data   += 35 + ext_len;
-
-	if (hs_len < 4 ||                               /* minimum one cipher */
-	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
-	     ext_len > hs_len)
-		goto not_ssl_hello;
-
-	/* Jump to the compression methods */
-	hs_len -= 2 + ext_len;
-	data   += 2 + ext_len;
-
-	if (hs_len < 2 ||                       /* minimum one compression method */
-            data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
-		goto not_ssl_hello;
-
-	/* Jump to the extensions */
-	hs_len -= 1 + data[0];
-	data   += 1 + data[0];
-
-	if (hs_len < 2 ||                       /* minimum one extension list length */
-	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
-		goto not_ssl_hello;
-
-	hs_len = ext_len; /* limit ourselves to the extension length */
-	data += 2; /* Now 'data' points to the first content byte of an extension */
-
-	while (hs_len >= 4) {
-		int ext_type, keyshare_len;
-
-		ext_type = (data[0] << 8) + data[1]; /* Extension type */
-		ext_len  = (data[2] << 8) + data[3]; /* Extension length */
-
-		if (ext_len > hs_len - 4) /* Extension too long */
+		if (ext_len > cp.hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
 		if (ext_type == 51) { /* Keyshare extension type ID is 51dec */
 			if (ext_len < 2) /* need at least one entry of 2 bytes in the list length */
 				goto not_ssl_hello;
 
-			keyshare_len = (data[4] << 8) + data[5]; /* Client keyshare length */
-			if (keyshare_len < 2 || keyshare_len > hs_len - 6)
+			keyshare_len = (cp.data[4] << 8) + cp.data[5]; /* Client keyshare length */
+			if (keyshare_len < 2 || keyshare_len > cp.hs_len - 6)
 				goto not_ssl_hello; /* at least 2 bytes per keyshare */
-			dataPointer = data + 6; /* start of keyshare entries */
+			dataPointer = cp.data + 6; /* start of keyshare entries */
 			readPosition = 0;
 			numberOfKeyshares = 0;
 			smp_trash = get_trash_chunk();
@@ -1013,8 +710,8 @@ smp_fetch_ssl_keyshare_groups(const struct arg *args, struct sample *smp, const 
 
 			return 1;
 		}
-		hs_len -= 4 + ext_len;
-		data   += 4 + ext_len;
+		cp.hs_len -= 4 + ext_len;
+		cp.data   += 4 + ext_len;
 	}
 	/* keyshare groups not found */
 	goto not_ssl_hello;
@@ -1361,10 +1058,10 @@ smp_fetch_ssl_hello_alpn(const struct arg *args, struct sample *smp, const char 
 	/* alpn not found */
 	goto not_ssl_hello;
 
- too_short:
+too_short:
 	smp->flags = SMP_F_MAY_CHANGE;
 
- not_ssl_hello:
+not_ssl_hello:
 
 	return 0;
 }
