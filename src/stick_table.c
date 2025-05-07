@@ -296,118 +296,108 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 	struct stksess *ts;
 	struct eb32_node *eb;
 	int max_search; // no more than 50% misses
-	int max_per_shard;
-	int done_per_shard;
 	int batched = 0;
-	int updt_locked;
-	int looped;
+	int updt_locked = 0;
+	int looped = 0;
+	unsigned int cur_shard;
 	int shard;
 
-	shard = 0;
+	cur_shard = t->last_exp_shard;
+
+	do {
+		shard = cur_shard + 1;
+		if (shard == CONFIG_HAP_TBL_BUCKETS)
+			shard = 0;
+	} while (_HA_ATOMIC_CAS(&t->last_exp_shard, &cur_shard, shard) != 0 && __ha_cpu_relax());
 
 	if (to_batch > STKTABLE_MAX_UPDATES_AT_ONCE)
 		to_batch = STKTABLE_MAX_UPDATES_AT_ONCE;
 
 	max_search = to_batch * 2; // no more than 50% misses
-	max_per_shard = (to_batch + CONFIG_HAP_TBL_BUCKETS - 1) / CONFIG_HAP_TBL_BUCKETS;
 
 	while (batched < to_batch) {
-		done_per_shard = 0;
-		looped = 0;
-		updt_locked = 0;
-
 		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
 
 		eb = eb32_lookup_ge(&t->shards[shard].exps, now_ms - TIMER_LOOK_BACK);
-		while (batched < to_batch && done_per_shard < max_per_shard) {
-			if (unlikely(!eb)) {
-				/* we might have reached the end of the tree, typically because
-				 * <now_ms> is in the first half and we're first scanning the last
-				 * half. Let's loop back to the beginning of the tree now if we
-				 * have not yet visited it.
-				 */
-				if (looped)
-					break;
-				looped = 1;
-				eb = eb32_first(&t->shards[shard].exps);
-				if (likely(!eb))
-					break;
-			}
-
-			if (--max_search < 0)
+		if (unlikely(!eb)) {
+			/* we might have reached the end of the tree, typically because
+			 * <now_ms> is in the first half and we're first scanning the last
+			 * half. Let's loop back to the beginning of the tree now if we
+			 * have not yet visited it.
+			 */
+			if (looped)
 				break;
-
-			/* timer looks expired, detach it from the queue */
-			ts = eb32_entry(eb, struct stksess, exp);
-			eb = eb32_next(eb);
-
-			/* don't delete an entry which is currently referenced */
-			if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
-				continue;
-
-			eb32_delete(&ts->exp);
-
-			if (ts->expire != ts->exp.key) {
-				if (!tick_isset(ts->expire))
-					continue;
-
-				ts->exp.key = ts->expire;
-				eb32_insert(&t->shards[shard].exps, &ts->exp);
-
-				/* the update might have jumped beyond the next element,
-				 * possibly causing a wrapping. We need to check whether
-				 * the next element should be used instead. If the next
-				 * element doesn't exist it means we're on the right
-				 * side and have to check the first one then. If it
-				 * exists and is closer, we must use it, otherwise we
-				 * use the current one.
-				 */
-				if (!eb)
-					eb = eb32_first(&t->shards[shard].exps);
-
-				if (!eb || tick_is_lt(ts->exp.key, eb->key))
-					eb = &ts->exp;
-
-				continue;
-			}
-
-			/* if the entry is in the update list, we must be extremely careful
-			 * because peers can see it at any moment and start to use it. Peers
-			 * will take the table's updt_lock for reading when doing that, and
-			 * with that lock held, will grab a ref_cnt before releasing the
-			 * lock. So we must take this lock as well and check the ref_cnt.
-			 */
-			if (!updt_locked) {
-				updt_locked = 1;
-				HA_RWLOCK_WRLOCK(STK_TABLE_UPDT_LOCK, &t->updt_lock);
-			}
-			/* now we're locked, new peers can't grab it anymore,
-			 * existing ones already have the ref_cnt.
-			 */
-			if (HA_ATOMIC_LOAD(&ts->ref_cnt))
-				continue;
-
-			/* session expired, trash it */
-			ebmb_delete(&ts->key);
-			MT_LIST_DELETE(&ts->pend_updts);
-			eb32_delete(&ts->upd);
-			__stksess_free(t, ts);
-			batched++;
-			done_per_shard++;
+			looped = 1;
+			eb = eb32_first(&t->shards[shard].exps);
+			if (likely(!eb))
+				break;
 		}
 
-		if (updt_locked)
-			HA_RWLOCK_WRUNLOCK(STK_TABLE_UPDT_LOCK, &t->updt_lock);
-
-		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
-
-		if (max_search <= 0)
+		if (--max_search < 0)
 			break;
 
-		shard = (shard + 1) % CONFIG_HAP_TBL_BUCKETS;
-		if (!shard)
-			break;
+		/* timer looks expired, detach it from the queue */
+		ts = eb32_entry(eb, struct stksess, exp);
+		eb = eb32_next(eb);
+
+		/* don't delete an entry which is currently referenced */
+		if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
+			continue;
+
+		eb32_delete(&ts->exp);
+
+		if (ts->expire != ts->exp.key) {
+			if (!tick_isset(ts->expire))
+				continue;
+
+			ts->exp.key = ts->expire;
+			eb32_insert(&t->shards[shard].exps, &ts->exp);
+
+			/* the update might have jumped beyond the next element,
+			 * possibly causing a wrapping. We need to check whether
+			 * the next element should be used instead. If the next
+			 * element doesn't exist it means we're on the right
+			 * side and have to check the first one then. If it
+			 * exists and is closer, we must use it, otherwise we
+			 * use the current one.
+			 */
+			if (!eb)
+				eb = eb32_first(&t->shards[shard].exps);
+
+			if (!eb || tick_is_lt(ts->exp.key, eb->key))
+				eb = &ts->exp;
+
+			continue;
+		}
+
+		/* if the entry is in the update list, we must be extremely careful
+		 * because peers can see it at any moment and start to use it. Peers
+		 * will take the table's updt_lock for reading when doing that, and
+		 * with that lock held, will grab a ref_cnt before releasing the
+		 * lock. So we must take this lock as well and check the ref_cnt.
+		 */
+		if (!updt_locked) {
+			updt_locked = 1;
+			HA_RWLOCK_WRLOCK(STK_TABLE_UPDT_LOCK, &t->updt_lock);
+		}
+		/* now we're locked, new peers can't grab it anymore,
+		 * existing ones already have the ref_cnt.
+		 */
+		if (HA_ATOMIC_LOAD(&ts->ref_cnt))
+			continue;
+
+		/* session expired, trash it */
+		ebmb_delete(&ts->key);
+		MT_LIST_DELETE(&ts->pend_updts);
+		eb32_delete(&ts->upd);
+		__stksess_free(t, ts);
+		batched++;
 	}
+
+	if (updt_locked)
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_UPDT_LOCK, &t->updt_lock);
+
+	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
 
 	return batched;
 }

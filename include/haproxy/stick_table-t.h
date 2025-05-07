@@ -217,6 +217,7 @@ struct stktable {
 	unsigned int refcnt;     /* number of local peer over all peers sections
 				    attached to this table */
 	unsigned int current;     /* number of sticky sessions currently in table */
+	unsigned int last_exp_shard; /* last shard we visited when expiring entries */
 	__decl_thread(HA_RWLOCK_T lock); /* lock related to the table */
 
 	THREAD_ALIGN(64);
