@@ -211,6 +211,7 @@ struct stktable {
 	struct {
 		struct eb_root keys;      /* head of sticky session tree */
 		struct eb_root exps;      /* head of sticky session expiration tree */
+		unsigned int min_exp;     /* closest next expiration */
 		__decl_thread(HA_RWLOCK_T sh_lock); /* for the trees above */
 	} shards[CONFIG_HAP_TBL_BUCKETS];
 
