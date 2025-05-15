@@ -878,7 +878,7 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl)
 	*ssl = SSL_new(ssl_ctx);
 	if (!*ssl) {
 		if (!retry--)
-			goto leave;
+			goto err;
 
 		pool_gc(NULL);
 		goto retry;
@@ -889,7 +889,7 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl)
 		SSL_free(*ssl);
 		*ssl = NULL;
 		if (!retry--)
-			goto leave;
+			goto err;
 
 		pool_gc(NULL);
 		goto retry;
@@ -899,6 +899,9 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl)
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
 	return ret;
+ err:
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_NEW, qc);
+	goto leave;
 }
 
 #ifdef HAVE_SSL_0RTT_QUIC
@@ -996,6 +999,7 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc)
 	return !ret;
 
  err:
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_NEW, qc);
 	pool_free(pool_head_quic_ssl_sock_ctx, ctx);
 	goto leave;
 }
