@@ -3402,6 +3402,19 @@ show sess [<id> | all | help] [<options>*]
                    analysis. It is only displayed if it was captured.
     - susp         only show streams considered as suspicious by the developers
                    based on criteria that may in time or vary along versions.
+    - fsrc [<addr>][:<port>] only show streams with <addr> as optional source
+                             frontent address and <port> as optional port.
+    - fdst [<addr>][:<port>] only show streams with <addr> as optional destination
+                             frontent address and <port> as optional port.
+    - bsrc [<addr>][:<port>] only show streams with <addr> as optional source
+                             backend address and <port> as optional port.
+    - bdst [<addr>][:<port>] only show streams with <addr> as optional destination
+                             backend address and <port> as optional port.
+
+   Note that for fsrc, fdst, bsrc and bdst options, at least one parameter must
+   be provided (the addresse or the port). Only one address may be used by
+   direction (only one option between fdst and bdst, and only one option between
+   fsrc and bsrc).
 
 show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
           [typed|json] [desc] [up|no-maint]

@@ -3293,6 +3293,8 @@ void list_services(FILE *out)
 		fprintf(out, " none\n");
 }
 
+static const struct sockaddr_storage sk_null;
+
 /* appctx context used by the "show sess" command */
 /* flags used for show_sess_ctx.flags */
 #define CLI_SHOWSESS_F_SUSP     0x00000001   /* show only suspicious streams */
@@ -3300,6 +3302,12 @@ void list_services(FILE *out)
 #define CLI_SHOWSESS_F_SERVER   0x00000004   /* show only streams attached to this server */
 #define CLI_SHOWSESS_F_BACKEND  0x00000008   /* show only streams attached to this backend */
 #define CLI_SHOWSESS_F_FRONTEND 0x00000010   /* show only streams attached to this frontend */
+#define CLI_SHOWSESS_F_FSRC     0x00000020   /* show only streams with this frontend source address */
+#define CLI_SHOWSESS_F_FDST     0x00000040   /* show only streams with this frontend destination address */
+#define CLI_SHOWSESS_F_BSRC     0x00000080   /* show only streams with this backend source address */
+#define CLI_SHOWSESS_F_BDST     0x00000100   /* show only streams with this backend destination address */
+#define CLI_SHOWSESS_F_NULL_SRC 0x00000200   /* filter with a null source address */
+#define CLI_SHOWSESS_F_NULL_DST 0x00000400   /* filter with a null destination address */
 
 struct show_sess_ctx {
 	struct bref bref;	/* back-reference from the session being dumped */
@@ -3309,9 +3317,13 @@ struct show_sess_ctx {
 	unsigned int uid;	/* if non-null, the uniq_id of the session being dumped */
 	unsigned int min_age;   /* minimum age of streams to dump */
 	unsigned int flags;     /* CLI_SHOWSESS_* */
+	struct sockaddr_storage src; /* frontend or backend source address to be used as filter */
+	struct sockaddr_storage dst; /* frontend or backend destination address to be used as filter */
 	int section;		/* section of the session being dumped */
 	int pos;		/* last position of the current session's buffer */
 };
+
+DECLARE_STATIC_POOL(pool_head_show_sess_ctx, "show_sess_ctx", sizeof(struct show_sess_ctx));
 
 /* This function appends a complete dump of a stream state onto the buffer,
  * possibly anonymizing using the specified anon_key. The caller is responsible
@@ -3768,18 +3780,20 @@ static int stats_dump_full_strm_to_buffer(struct appctx *appctx, struct stream *
 
 static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct show_sess_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	struct show_sess_ctx *ctx;
 	int cur_arg = 2;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
-	/* now all sessions by default */
-	ctx->target = NULL;
-	ctx->min_age = 0;
-	ctx->section = 0; /* start with stream status */
-	ctx->pos = 0;
-	ctx->thr = 0;
+	ctx = appctx->svcctx;
+	if (!ctx) {
+		ctx = pool_zalloc(pool_head_show_sess_ctx);
+		if (!ctx)
+			return cli_err(appctx, "show sess context allocation failed.\n");
+
+		appctx->svcctx = ctx;
+	}
 
 	if (*args[cur_arg] && strcmp(args[cur_arg], "older") == 0) {
 		unsigned timeout;
@@ -3814,6 +3828,10 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 			     "   server <b/s> only show streams attached to this backend+server\n"
 			     "   backend <b>  only show streams attached to this backend\n"
 			     "   frontend <f> only show streams attached to this frontend\n"
+			     "   fsrc [<addr>][:<port>] only show streams with this frontend source address\n"
+			     "   fdst [<addr>][:<port>] only show streams with this frontend destination address\n"
+			     "   bsrc [<addr>][:<port>] only show streams with this backend source address\n"
+			     "   bdst [<addr>][:<port>] only show streams with this backend destination address\n"
 			     "Without any argument, all streams are dumped in a shorter format.");
 		return cli_err(appctx, trash.area);
 	}
@@ -3888,6 +3906,73 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 			ctx->filter = fe;
 			cur_arg++;
 		}
+		else if (*args[cur_arg] &&
+		         (strcmp(args[cur_arg], "fsrc") == 0 ||
+		          strcmp(args[cur_arg], "fdst") == 0 ||
+		          strcmp(args[cur_arg], "bsrc") == 0 ||
+		          strcmp(args[cur_arg], "bdst") == 0)) {
+			char *err = NULL;
+			unsigned int sk_null_flag = 0;
+			struct sockaddr_storage *sk, *ctx_sk;
+			const char *type = args[cur_arg][0] == 'f' ? "frontend" : "backend";
+			const char *dir  = args[cur_arg][1] == 's' ? "source"   : "destination";
+
+			if (!*args[cur_arg + 1]) {
+				chunk_printf(&trash, "Missing %s %s address and/or port\n", type, dir);
+				return cli_err(appctx, trash.area);
+			}
+
+			/* Only one address by direction */
+			if (*dir == 's' &&
+			    (ctx->flags & (CLI_SHOWSESS_F_FSRC|CLI_SHOWSESS_F_BSRC))) {
+				return cli_err(appctx, "Only one of backend or frontend "
+				               "source address may be filtered.\n");
+			}
+			else if (*dir == 'd' &&
+			         (ctx->flags & (CLI_SHOWSESS_F_FDST|CLI_SHOWSESS_F_BDST))) {
+				return cli_err(appctx, "Only one of backend or frontend "
+				               "destination address may be filtered.\n");
+			}
+
+			sk = str2sa_range(args[cur_arg + 1], NULL, NULL, NULL, NULL, NULL, NULL,
+			                  &err, NULL, NULL, NULL, PA_O_STREAM | PA_O_PORT_OK);
+			if (!sk) {
+				chunk_printf(&trash, "Wrong %s %s address: %s\n", type, dir, err);
+				free(err);
+				return cli_err(appctx, trash.area);
+			}
+
+			if ((sk->ss_family != AF_INET) && (sk->ss_family != AF_INET6)) {
+				chunk_printf(&trash, "Wrong %s %s address: must be an IPv4"
+				             " or an IPv6 address\n", type, dir);
+				return cli_err(appctx, trash.area);
+			}
+
+			/* Address nullity check */
+			if ((sk->ss_family == AF_INET &&
+			    !memcmp(&((struct sockaddr_in *)sk)->sin_addr,
+			             &((struct sockaddr_in *)&sk_null)->sin_addr,
+			             sizeof(struct in_addr))) ||
+				(sk->ss_family == AF_INET6 &&
+				 !memcmp(&((struct sockaddr_in6 *)sk)->sin6_addr,
+				         &((struct sockaddr_in6 *)&sk_null)->sin6_addr,
+				         sizeof(struct in6_addr)))) {
+				sk_null_flag = *dir == 's' ?
+					CLI_SHOWSESS_F_NULL_SRC : CLI_SHOWSESS_F_NULL_DST;
+			}
+
+			/* Store the address */
+			ctx_sk = *dir == 's' ? &ctx->src : &ctx->dst;
+			*ctx_sk = *sk;
+			/* Store the flags */
+			ctx->flags |= sk_null_flag |
+				(args[cur_arg][0] == 'f' ?
+				 /* frontend */
+				 (args[cur_arg][1] == 's' ? CLI_SHOWSESS_F_FSRC : CLI_SHOWSESS_F_FDST) :
+				 /* backend */
+				 (args[cur_arg][1] == 's' ? CLI_SHOWSESS_F_BSRC : CLI_SHOWSESS_F_BDST));
+			cur_arg++;
+		}
 		else {
 			chunk_printf(&trash, "Unsupported option '%s', try 'help' for more info.\n", args[cur_arg]);
 			return cli_err(appctx, trash.area);
@@ -3905,6 +3990,40 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 	 */
 	appctx_strm(appctx)->stream_epoch = _HA_ATOMIC_FETCH_ADD(&stream_epoch, 1);
 	return 0;
+}
+
+
+/* Compare <fsk> address and port only when not null with <sk> depending on
+ * <null_fsk> boolean which is true if <fsk> address is null.
+ * Note that <fsk> port and address cannot be both null.
+ * Return 1 if matched, 0 if not.
+ * Return 1 if <sk> is NULL (could not be checked => not filtered)
+ */
+static inline int cli_sess_sk_to_be_skipped(struct sockaddr_storage *sk,
+                                            struct sockaddr_storage *fsk,
+                                            int null_fsk)
+{
+	int check_port = get_host_port(fsk);
+
+	/* Cannot compare. Do not skip */
+	if (!sk)
+		return 1;
+
+	/* Try first with ipcmp() as it can check the family, the address
+	 * and the port.
+	 */
+	if (!null_fsk)
+		return !ipcmp(sk, fsk, check_port);
+
+	/* Null address, the port must not be null. */
+	BUG_ON(!check_port);
+	if (sk->ss_family != fsk->ss_family)
+		return 0;
+
+	if (check_port != get_host_port(sk))
+		return 0;
+
+	return 1;
 }
 
 /* This function dumps all streams' states onto the stream connector's
@@ -3983,6 +4102,30 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			    !tick_is_expired(curr_strm->task->expire, now_ms) &&
 			    curr_strm->scf && curr_strm->scf->sedesc && curr_strm->scf->sedesc->se)
 				goto next_sess;
+		}
+
+		if (ctx->flags & (CLI_SHOWSESS_F_FSRC|CLI_SHOWSESS_F_FDST|
+		                  CLI_SHOWSESS_F_BSRC|CLI_SHOWSESS_F_BDST)) {
+			conn = ctx->flags & (CLI_SHOWSESS_F_FSRC|CLI_SHOWSESS_F_FDST) ?
+				objt_conn(strm_orig(curr_strm)) : sc_conn(curr_strm->scb);
+
+			if (conn) {
+				if (ctx->flags & (CLI_SHOWSESS_F_FSRC|CLI_SHOWSESS_F_BSRC)) {
+					if (!conn->src && !(th_ctx->flags & TH_FL_IN_ANY_HANDLER))
+						conn_get_src(conn);
+					if (!cli_sess_sk_to_be_skipped(conn->src, &ctx->src,
+					                               ctx->flags & CLI_SHOWSESS_F_NULL_SRC))
+					    goto next_sess;
+				}
+
+				if (ctx->flags & (CLI_SHOWSESS_F_FDST|CLI_SHOWSESS_F_BDST)) {
+					if (!conn->dst && !(th_ctx->flags & TH_FL_IN_ANY_HANDLER))
+						conn_get_dst(conn);
+					if (!cli_sess_sk_to_be_skipped(conn->dst, &ctx->dst,
+					                               ctx->flags & CLI_SHOWSESS_F_NULL_DST))
+					    goto next_sess;
+				}
+			}
 		}
 
 		if (ctx->target) {
@@ -4159,6 +4302,8 @@ static void cli_release_show_sess(struct appctx *appctx)
 			LIST_DELETE(&ctx->bref.users);
 		thread_release();
 	}
+	pool_free(pool_head_show_sess_ctx, ctx);
+	appctx->svcctx = NULL;
 }
 
 /* Parses the "shutdown session" directive, it always returns 1 */
